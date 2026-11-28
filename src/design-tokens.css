@@ -1,0 +1,77 @@
+/* ===========================================================================
+   设计语言 token 层（VH = video-hub）
+
+   参考 awesome-design-md 集合中 Notion 的列表 / 设置类界面结构（暖中性表面、
+   发丝边框、4px 间距节奏、克制圆角、44px 触控目标），语义状态角色借用
+   Mintlify 的绿 / 橙 / 红映射。品牌色保留本工程森绿 × 奶油白 × 珊瑚橙，
+   不照搬参考站点的紫色主 CTA。选型与出处见 docs/DESIGN-LANGUAGE.md。
+
+   所有 token 解析到既有主题变量（--p-* / --surface-border），深色与浅色
+   主题继续由主题层切换；本文件只定义尺度、层级、状态与品牌锚点，不引入
+   远程字体、内联脚本或新的网络资源。
+   =========================================================================== */
+
+:root {
+  /* 间距节奏（4px 基准） */
+  --vh-space-xxs: 4px;
+  --vh-space-xs: 8px;
+  --vh-space-sm: 12px;
+  --vh-space-md: 16px;
+  --vh-space-lg: 20px;
+  --vh-space-xl: 24px;
+  --vh-space-xxl: 32px;
+
+  /* 圆角：按钮 / 输入 md，卡片 / 行 lg，胶囊 full */
+  --vh-radius-xs: 4px;
+  --vh-radius-sm: 6px;
+  --vh-radius-md: 8px;
+  --vh-radius-lg: 12px;
+  --vh-radius-full: 9999px;
+
+  /* 字体层级（字号 / 字重；行高由组件按用途给） */
+  --vh-type-title-size: 13px;
+  --vh-type-title-weight: 600;
+  --vh-type-body-size: 13.5px;
+  --vh-type-body-weight: 500;
+  --vh-type-caption-size: 11.5px;
+  --vh-type-caption-weight: 400;
+  --vh-type-micro-size: 10px;
+  --vh-type-micro-weight: 600;
+  --vh-type-btn-size: 12.5px;
+  --vh-type-btn-weight: 500;
+
+  /* 表面与边框 */
+  --vh-surface-card: var(--p-s1);
+  --vh-surface-row: var(--p-s2);
+  --vh-surface-sunken: var(--p-s3);
+  --vh-border: 1px solid var(--surface-border);
+
+  /* 状态色（默认 / hover / active / disabled / 空 / 错误 / 加载） */
+  --vh-state-ready: var(--p-success);
+  --vh-state-failed: var(--p-danger);
+  --vh-state-idle: var(--p-dim);
+  --vh-state-loading: var(--p-dim);
+  --vh-state-disabled-opacity: .45;
+  --vh-state-hover: var(--p-hover);
+
+  /* 品牌锚点（不随主题改色；深色主题下的品牌强调色另见 --vh-brand-accent） */
+  --vh-brand: #214F3E;
+  --vh-brand-ink: #FCF6EC;
+  --vh-coral: #F07257;
+  --vh-brand-accent: #7FB89F;
+  --vh-brand-accent-ink: #10261D;
+  --vh-brand-tint: rgba(127, 184, 159, .16);
+
+  /* 触控目标 */
+  --vh-touch: 44px;
+  --vh-touch-sm: 36px;
+
+  /* 动效 */
+  --vh-motion-fast: .15s cubic-bezier(.2, 0, 0, 1);
+}
+
+html.theme-light {
+  --vh-brand-accent: var(--vh-brand);
+  --vh-brand-accent-ink: var(--vh-brand-ink);
+  --vh-brand-tint: rgba(33, 79, 62, .10);
+}

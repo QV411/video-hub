@@ -1,0 +1,120 @@
+/* HGsky 首页右侧工具栏：对齐 HGhub Feed 右侧互动栏的布局与节奏，
+   尺度/圆角/触控目标沿用 design-tokens.css。仅作用于 .hgsky-home 子树。 */
+
+/* 工具栏取代共享预览侧栏与翻页器（共享文件不改，按作用域覆盖） */
+.hgsky-home .hg-preview-actions,
+.hgsky-home .hg-preview-pager { display: none; }
+
+/* 详情弹层 / 全屏播放期间隐藏工具栏 */
+.hgsky-home:has(.hg-watching) .hgsky-toolbar,
+.hgsky-home:has(dialog.hg-detail-sheet[open]) .hgsky-toolbar { display: none; }
+
+.hgsky-toolbar {
+  position: absolute;
+  right: var(--vh-space-xl);
+  bottom: 130px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--vh-space-lg);
+  color: #fff;
+}
+.hgsky-toolbar button {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+.hgsky-toolbar button:disabled { opacity: var(--vh-state-disabled-opacity); }
+.hgsky-toolbar small { font-size: var(--vh-type-caption-size); color: #fffd; white-space: nowrap; }
+.hgsky-toolbar-glyph {
+  display: grid;
+  place-items: center;
+  width: var(--vh-touch);
+  height: var(--vh-touch);
+  background: #11151abb;
+  backdrop-filter: blur(12px);
+  border-radius: var(--vh-radius-full);
+}
+.hgsky-toolbar button[aria-pressed="true"] .hgsky-toolbar-glyph { box-shadow: inset 0 0 0 1.5px var(--p-primary); }
+.hgsky-toolbar-hot { color: var(--vh-coral); }
+.hgsky-toolbar-gold { color: #f5c451; }
+
+/* 作者头像 + 关注/追更角标（HGhub 右侧栏首项） */
+.hgsky-toolbar-avatar { position: relative; }
+.hgsky-toolbar-face {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border: 2px solid #fff;
+  border-radius: var(--vh-radius-full);
+  background: linear-gradient(135deg, var(--vh-coral), var(--vh-brand-accent));
+  color: #fff;
+  font-size: var(--vh-type-title-size);
+  font-weight: 700;
+}
+.hgsky-toolbar-plus {
+  position: absolute;
+  top: 38px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--vh-radius-full);
+  background: var(--p-primary);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+}
+.hgsky-toolbar-avatar small { margin-top: 6px; }
+
+/* 桌面端翻页器（HGhub desktop-browse-inline） */
+.hgsky-toolbar-pager {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--vh-space-xs);
+  color: #fff9;
+}
+.hgsky-toolbar-pager button {
+  width: var(--vh-touch-sm);
+  height: var(--vh-touch-sm);
+  background: #0004;
+  border: 1px solid #fff1;
+  border-radius: var(--vh-radius-full);
+  display: grid;
+  place-items: center;
+}
+.hgsky-toolbar-pager button:disabled { opacity: .25; }
+.hgsky-toolbar-pager small { font-size: var(--vh-type-micro-size); margin-top: 3px; }
+
+/* 评论弹层内容 */
+.hgsky-toolbar-comments {
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: var(--vh-space-md) var(--vh-space-md) var(--vh-space-xl);
+}
+
+/* 操作反馈 */
+.hgsky-toolbar-hint {
+  position: absolute;
+  top: 33%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 50;
+  padding: var(--vh-space-xs) var(--vh-space-md);
+  border-radius: var(--vh-radius-full);
+  background: #000b;
+  color: #fff;
+  font-size: var(--vh-type-caption-size);
+  pointer-events: none;
+}
+
+/* 平台 insets 与共享预览侧栏保持一致（watch-experience.css 的平台节奏） */
+.plat-android .hgsky-toolbar, .plat-ios .hgsky-toolbar { right: var(--vh-space-md); bottom: 124px; }
+.plat-windows .hgsky-toolbar, .plat-macos .hgsky-toolbar, .plat-linux .hgsky-toolbar { bottom: 90px; }
