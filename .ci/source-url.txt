@@ -1,2 +1,2 @@
-URL=https://sfile.chatglm.cn/workspace/file/f0/f0b65cc657.zip
-SHA=1c24d0dacbc8257e7a4d70f173a60ae2e24c037c0fc61410fe9845b2a802ee07
+URL=https://sfile.chatglm.cn/workspace/file/2d/2d98b78d2f.zip
+SHA=ae793576077062d064ebec7ef2355307369b1d2925f75b29ece8464c781b15f1
