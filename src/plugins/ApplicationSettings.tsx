@@ -17,12 +17,10 @@ import {
   downloadPickDir,
   downloadResetDir,
   downloadOpenDir,
-  downloadOpenStorageSettings,
   downloadSetKeepTs,
   type DownloadSettings,
 } from "../download";
 import { useDownloads } from "../downloadStore";
-import { accessStatus, accessGuidance } from "../download-access";
 export default function ApplicationSettings({ onBack }: { onBack: () => void }) {
   const app = useStore(), host = useHost(), [error, setError] = useState("");
   const [picker, setPicker] = useState(false);
@@ -38,7 +36,6 @@ export default function ApplicationSettings({ onBack }: { onBack: () => void }) 
   const dlPick = async () => { setDlBusy(true); setError(""); try { const p = await downloadPickDir(); if (p) await loadDl(); } catch (e) { setError(pluginError(e)); } finally { setDlBusy(false); } };
   const dlReset = async () => { setDlBusy(true); setError(""); try { await downloadResetDir(); await loadDl(); } catch (e) { setError(pluginError(e)); } finally { setDlBusy(false); } };
   const dlOpen = async () => { try { await downloadOpenDir(); } catch (e) { setError(pluginError(e)); } };
-  const dlAuthorize = async () => { setDlBusy(true); setError(""); try { await downloadOpenStorageSettings(); await loadDl(); } catch (e) { setError(pluginError(e)); } finally { setDlBusy(false); } };
   const dlRetries = async (n: number) => { setDlBusy(true); setError(""); try { const r = await downloadSetRetries(n); setDlSettings(s => s ? { ...s, retries: r.retries } : s); } catch (e) { setError(pluginError(e)); } finally { setDlBusy(false); } };
   const dlKeepTs = async (keep: boolean) => { setDlBusy(true); setError(""); try { const r = await downloadSetKeepTs(keep); setDlSettings(s => s ? { ...s, keepTs: r.keepTs } : s); } catch (e) { setError(pluginError(e)); } finally { setDlBusy(false); } };
   useEffect(() => { let live = true; void request<Record<string, string>>("resolver.preferences.get").then(p => { if (live) setResolverPrefs(p); }).catch(e => { if (live) setError(pluginError(e)); }); return () => { live = false; }; }, [request]);
@@ -81,17 +78,9 @@ export default function ApplicationSettings({ onBack }: { onBack: () => void }) 
             </>}
           </div>
         </Setting>
-        {dlPrefs?.mobile && (() => {
-          const status = accessStatus(dlPrefs);
-          if (status === "granted") {
-            return <Setting icon={<IDownload size={16}/>} title="文件访问" description="已授权所有文件访问，可直接写入公共下载目录" />;
-          }
-          return (
-            <Setting icon={<ILockF size={16}/>} title={`文件访问${status === "detecting" ? "检测中" : "未授权"}`} description={accessGuidance(dlPrefs)}>
-              <button onClick={() => void dlAuthorize()} disabled={dlBusy || status === "detecting"} className="dl-btn dl-btn-primary">授权所有文件访问</button>
-            </Setting>
-          );
-        })()}
+        {dlPrefs?.mobile && (
+          <Setting icon={<IDownload size={16}/>} title="下载目录" description="工作区为应用私有缓存，无需任何存储权限；完成的 MP4 自动发布到 Movies/video-hub 公共媒体库" />
+        )}
         <Setting icon={<IRefresh size={16}/>} title="分片失败重试" description="每个分片或清单拉取失败后的额外重试次数（0–3）">
           <select aria-label="重试次数" value={dlPrefs?.retries ?? 1} disabled={dlBusy} onChange={e => void dlRetries(Number(e.target.value))}>
             {[0, 1, 2, 3].map(n => <option key={n} value={n}>{n} 次</option>)}

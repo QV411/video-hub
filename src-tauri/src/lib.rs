@@ -33,10 +33,10 @@ pub fn run() {
             Ok(())
         }).build());
     #[cfg(target_os = "android")]
-    let builder = builder.plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("storage-access")
+    let builder = builder.plugin(tauri::plugin::Builder::<tauri::Wry, ()>::new("media-bridge")
         .setup(|app, api| {
-            let handle = api.register_android_plugin("com.videohub.player", "StorageAccessPlugin")?;
-            app.manage(android_storage::AndroidStorage(handle));
+            let handle = api.register_android_plugin("com.videohub.player", "MediaBridgePlugin")?;
+            app.manage(android_storage::AndroidMedia(handle));
             Ok(())
         }).build());
     builder
@@ -70,8 +70,8 @@ pub fn run() {
             let dl = Arc::new(download::DownloadHost::new(dir.clone()));
             app.manage(dl.clone());
             #[cfg(target_os = "android")]
-            if let Some(storage) = app.try_state::<android_storage::AndroidStorage>() {
-                dl.set_storage(storage.inner().clone());
+            if let Some(media) = app.try_state::<android_storage::AndroidMedia>() {
+                dl.set_media(media.inner().clone());
             }
             // Attach the handle before any frontend request so queued downloads
             // are restored and event pushes have an outlet.
@@ -100,7 +100,8 @@ pub fn run() {
             download::download_reset_dir,
             download::download_open_dir,
             download::download_open_file,
-            download::download_open_storage_settings,
+            download::download_request_legacy_write,
+            download::download_publish_pending,
             download::download_get_settings,
             download::download_set_retries,
             download::download_set_keep_ts

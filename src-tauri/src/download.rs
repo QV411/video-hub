@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::plugins::PluginHost;
 #[cfg(target_os = "android")]
-use crate::android_storage::AndroidStorage;
+use crate::android_storage::AndroidMedia;
 use tauri::Emitter;
 use tauri::Manager;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
@@ -28,8 +28,10 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use url::Url;
 
-/// Android public shared download root: the shared-storage `Movies/video-hub`
-/// directory, reachable once all-files access is granted.
+/// Android public publish folder for finished MP4s. Under the scoped-storage
+/// model (TargetAPI 37, no all-files access) this is a MediaStore collection
+/// target (`Movies/video-hub`), not a writable working directory: the download
+/// engine works in the app-private dir and publishes results here.
 #[cfg(target_os = "android")]
 const ANDROID_PUBLIC_ROOT: &str = "/storage/emulated/0/Movies/video-hub";
 
@@ -102,6 +104,23 @@ pub struct DownloadJob {
     pub episodes: Vec<EpisodeRef>,
     #[serde(default)]
     pub updated_at: u64,
+    /// Per-episode publish record for finished MP4s that were published into
+    /// the shared `Movies/video-hub` collection (scoped-storage model). The
+    /// private working copy is removed after a successful publish; episodes
+    /// missing here (publish failed / desktop) still resolve through
+    /// `video_path`.
+    #[serde(default)]
+    #[cfg(target_os = "android")]
+    pub published: std::collections::HashMap<u32, PublishedFile>,
+}
+
+/// One published MP4: MediaStore content URI plus the public display path.
+#[cfg(target_os = "android")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishedFile {
+    pub uri: String,
+    pub public_path: String,
 }
 
 struct QueuedTask {
@@ -127,18 +146,16 @@ pub struct DownloadHost {
     #[cfg_attr(target_os = "android", allow(dead_code))]
     app_data: PathBuf,
     default_root: PathBuf,
-    /// Android-only public shared root; `None` on desktop.
+    /// Android-only public publish folder (MediaStore `Movies/video-hub`);
+    /// `None` on desktop. Display-only — never used as a working directory.
     external_root: Option<PathBuf>,
     config_file: PathBuf,
     config: Mutex<DownloadConfig>,
     root: Mutex<Option<PathBuf>>,
-    /// Android all-files bridge; populated during setup. `None` before the
-    /// bridge registers, or on desktop.
+    /// Android scoped-storage media bridge; populated during setup. `None`
+    /// before the bridge registers, or on desktop.
     #[cfg(target_os = "android")]
-    storage: Mutex<Option<AndroidStorage>>,
-    /// Cached all-files grant; `None` until the first storage refresh.
-    #[cfg(target_os = "android")]
-    storage_granted: Mutex<Option<bool>>,
+    media: Mutex<Option<AndroidMedia>>,
     /// Cached Android native library directory (holds the bundled ffmpeg and
     /// its libav* dependencies). `None` until the bridge reports it.
     #[cfg(target_os = "android")]
@@ -149,9 +166,9 @@ pub struct DownloadHost {
     stopping: AtomicBool,
     handle: Mutex<Option<tauri::AppHandle>>,
     last_emit: Mutex<HashMap<String, u64>>,
-    /// Active root mode: `public` (platform default shared root), `fallback`
-    /// (app-private directory after a failed grant) or `custom` (desktop
-    /// user-picked directory).
+    /// Active root mode: `workdir` (Android: app-private working directory,
+    /// publishes to the shared collection when done), `public` (desktop:
+    /// app-data default) or `custom` (desktop user-picked directory).
     dir_mode: Mutex<String>,
     /// Human-readable cause for the active root, surfaced to the UI.
     dir_reason: Mutex<String>,
@@ -181,9 +198,7 @@ impl DownloadHost {
             config: Mutex::new(config),
             root: Mutex::new(Some(root)),
             #[cfg(target_os = "android")]
-            storage: Mutex::new(None),
-            #[cfg(target_os = "android")]
-            storage_granted: Mutex::new(None),
+            media: Mutex::new(None),
             #[cfg(target_os = "android")]
             native_lib_dir: Mutex::new(None),
             jobs: Mutex::new(HashMap::new()),
@@ -193,9 +208,9 @@ impl DownloadHost {
             handle: Mutex::new(None),
             last_emit: Mutex::new(HashMap::new()),
             #[cfg(target_os = "android")]
-            dir_mode: Mutex::new("fallback".to_string()),
+            dir_mode: Mutex::new("workdir".to_string()),
             #[cfg(target_os = "android")]
-            dir_reason: Mutex::new("尚未检测文件访问授权状态".to_string()),
+            dir_reason: Mutex::new("工作目录为应用私有缓存，无需存储权限".to_string()),
             #[cfg(not(target_os = "android"))]
             dir_mode: Mutex::new("public".to_string()),
             #[cfg(not(target_os = "android"))]
@@ -203,12 +218,18 @@ impl DownloadHost {
         }
     }
 
-    /// Attach the Android storage bridge after the mobile plugin registers.
+    /// Attach the Android media bridge after the mobile plugin registers.
     #[cfg(target_os = "android")]
-    pub fn set_storage(&self, bridge: AndroidStorage) {
-        if let Ok(mut storage) = self.storage.lock() {
-            *storage = Some(bridge);
+    pub fn set_media(&self, bridge: AndroidMedia) {
+        if let Ok(mut media) = self.media.lock() {
+            *media = Some(bridge);
         }
+    }
+
+    /// Clone the media bridge, if registered.
+    #[cfg(target_os = "android")]
+    fn media_bridge(&self) -> Option<AndroidMedia> {
+        self.media.lock().ok().and_then(|m| m.clone())
     }
 
     /// Re-resolve the active root against the current storage grant.
@@ -223,37 +244,22 @@ impl DownloadHost {
     pub async fn refresh_storage(&self) {
         #[cfg(target_os = "android")]
         {
-            let bridge = self.storage.lock().ok().and_then(|s| s.clone());
-            let granted = match bridge.as_ref() {
-                Some(bridge) => bridge.is_manager().await,
-                None => false,
-            };
-            if let Ok(mut cache) = self.storage_granted.lock() {
-                *cache = Some(granted);
-            }
-            if let Some(bridge) = bridge {
+            // Scoped-storage model: the working directory is ALWAYS the
+            // app-private dir — writable with zero permissions on every API
+            // level. Finished MP4s are published to the shared collection
+            // (`Movies/video-hub`) through the media bridge afterwards.
+            if let Some(bridge) = self.media_bridge() {
                 if let Some(dir) = bridge.native_lib_dir().await {
                     if let Ok(mut cache) = self.native_lib_dir.lock() {
                         *cache = Some(dir);
                     }
                 }
             }
-            let (target, mode, reason): (PathBuf, String, String) = match (granted, self.external_root.clone()) {
-                (true, Some(ext)) => match std::fs::create_dir_all(&ext) {
-                    Ok(_) => (ext, "public".into(), "已获得所有文件访问授权，使用公共目录".into()),
-                    Err(e) => (
-                        self.default_root.clone(),
-                        "fallback".into(),
-                        format!("公共目录创建失败（{e}），已回退应用专属目录"),
-                    ),
-                },
-                _ => (
-                    self.default_root.clone(),
-                    "fallback".into(),
-                    "未获得所有文件访问授权，已回退到应用专属目录".into(),
-                ),
-            };
-            self.store_root(&target, &mode, &reason);
+            let target = self.default_root.clone();
+            let _ = std::fs::create_dir_all(&target);
+            let mode = "workdir";
+            let reason = "工作目录为应用私有缓存（无权限需求）；完成的 MP4 自动发布到 Movies/video-hub";
+            self.store_root(&target, mode, reason);
             cleanup_legacy_nested_root(&target);
             emit_dir(self);
         }
@@ -1334,7 +1340,40 @@ async fn download_one(
         j.progress = progress_base + progress_span;
         j.message = format!("第 {} 集已可离线", ep.number);
     }, false);
+    // Scoped storage: publish the finished MP4 into the shared collection and
+    // record it on the job (failure keeps the private copy + a status note).
+    #[cfg(target_os = "android")]
+    publish_episode(host, &task.key, ep.number, &video_path).await;
     Ok(video_path)
+}
+
+/// Publish one finished episode MP4 into the shared `Movies/video-hub`
+/// collection and record the content URI on the job. On success the private
+/// working copy is removed (the shared copy is authoritative); on failure the
+/// private copy stays and the job message explains why.
+#[cfg(target_os = "android")]
+async fn publish_episode(host: &DownloadHost, job_id: &str, ep: u32, video_path: &Path) {
+    let Some(bridge) = host.media_bridge() else { return };
+    let Some(name) = video_path.file_name().and_then(|n| n.to_str()) else { return };
+    match bridge.publish_to_movies(&video_path.to_string_lossy(), name).await {
+        Ok((uri, public_path)) => {
+            let _ = std::fs::remove_file(video_path);
+            bump_job(host, job_id, |j| {
+                j.published.insert(ep, PublishedFile { uri, public_path });
+                j.message = format!("第 {} 集已离线 · 已发布到 Movies/video-hub", ep);
+            }, true);
+        }
+        Err(e) => {
+            let note = if e.contains("NEED_WRITE_PERMISSION") {
+                format!("第 {ep} 集已生成；发布到公共目录需要存储写权限，可稍后点击「重新发布」")
+            } else {
+                format!("第 {ep} 集已离线；发布到公共目录失败：{e}")
+            };
+            bump_job(host, job_id, |j| {
+                j.message = note;
+            }, true);
+        }
+    }
 }
 
 /// Write a file via a temporary sibling and rename over the target, so a crash
@@ -1982,21 +2021,22 @@ pub async fn get_settings(host: &DownloadHost) -> Result<Value, String> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let pickable = false;
     #[cfg(target_os = "android")]
-    let storage_granted = host
-        .storage_granted
-        .lock()
-        .ok()
-        .and_then(|g| *g)
-        .unwrap_or(false);
-    #[cfg(not(target_os = "android"))]
-    let storage_granted = true;
-    #[cfg(target_os = "android")]
-    let manufacturer = match host.storage.lock().ok().and_then(|s| s.clone()) {
+    let manufacturer = match host.media_bridge() {
         Some(bridge) => bridge.manufacturer().await,
         None => None,
     };
     #[cfg(not(target_os = "android"))]
     let manufacturer: Option<String> = None;
+    // Legacy write grant only matters on API <= 29 devices; API 30+ resolves
+    // true without any permission. Surfaced so the UI can offer the runtime
+    // request when a publish failed with NEED_WRITE_PERMISSION.
+    #[cfg(target_os = "android")]
+    let storage_granted = match host.media_bridge() {
+        Some(bridge) => bridge.legacy_write_status().await,
+        None => false,
+    };
+    #[cfg(not(target_os = "android"))]
+    let storage_granted = true;
     Ok(json!({
         "dir": dir,
         "effectiveDir": dir,
@@ -2013,23 +2053,8 @@ pub async fn get_settings(host: &DownloadHost) -> Result<Value, String> {
     }))
 }
 
-/// Open the system all-files access settings page (Android only). Desktop/iOS
-/// report success without an action.
-pub async fn open_storage_settings(host: &DownloadHost) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    {
-        let Some(bridge) = host.storage.lock().ok().and_then(|s| s.clone()) else {
-            return Err("文件访问桥接尚未就绪".into());
-        };
-        bridge.open_settings().await
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = host;
-        Ok(())
-    }
-}
-
+/// Request the legacy runtime write grant (Android API <= 29 only; the
+/// shared-collection publish needs it there). API 30+ resolves immediately.
 pub fn set_retries(host: &DownloadHost, retries: u8) -> Result<Value, String> {
     let clamped = retries.clamp(0, 3);
     {
@@ -2053,24 +2078,138 @@ pub fn set_keep_ts(host: &DownloadHost, keep: bool) -> Result<Value, String> {
     Ok(json!({ "keepTs": keep }))
 }
 
-pub fn open_dir(app: &tauri::AppHandle, host: &DownloadHost) -> Result<(), String> {
-    let dir = root(host)?;
-    let path = dir.to_string_lossy().to_string();
+pub async fn request_legacy_write(host: &DownloadHost) -> Result<bool, String> {
     #[cfg(target_os = "android")]
     {
-        // Prefer MT Manager (bin.mt.plus) opened at the download directory;
-        // when it is not installed (or refuses the launch), fall through to
-        // the generic opener below.
-        if app.opener().open_dir(path.clone()).is_ok() {
-            return Ok(());
-        }
+        let Some(bridge) = host.media_bridge() else {
+            return Err("媒体桥接尚未就绪".into());
+        };
+        bridge.request_legacy_write().await
     }
-    app.opener()
-        .open_path(path, None::<&str>)
-        .map_err(|e| e.to_string())
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = host;
+        Ok(true)
+    }
 }
 
-pub fn open_file(
+/// Re-publish finished episodes whose publish previously failed (e.g. the
+/// runtime write grant was missing). Walks done jobs, publishing every
+/// episode that has a private MP4 but no publish record yet.
+pub async fn publish_pending(app: tauri::AppHandle, host: &DownloadHost) -> Result<Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        let Some(bridge) = host.media_bridge() else {
+            return Err("媒体桥接尚未就绪".into());
+        };
+        // Snapshot the re-publish targets: every done episode that still has a
+        // private MP4 (publish failed earlier, e.g. missing runtime grant on
+        // API <= 29) but no publish record.
+        let targets: Vec<(String, u32, PathBuf)> = {
+            let jobs = host.jobs.lock().map_err(|_| "download lock".to_string())?;
+            let root = &host.default_root;
+            let mut out = Vec::new();
+            for j in jobs.values().filter(|j| j.status == "done") {
+                let folder = media_folder_name(&j.title, &j.media_id);
+                if j.mode == "series" {
+                    for ep in &j.ready_eps {
+                        let name = format!("{folder}-{ep}.mp4");
+                        let p = root.join(&j.title).join(&name);
+                        if p.is_file() && !j.published.contains_key(ep) {
+                            out.push((j.id.clone(), *ep, p));
+                        }
+                    }
+                } else {
+                    let name = format!("{folder}-{}.mp4", j.ep);
+                    let p = root.join(&j.title).join(&name);
+                    if p.is_file() && !j.published.contains_key(&j.ep) {
+                        out.push((j.id.clone(), j.ep, p));
+                    }
+                }
+            }
+            out
+        };
+        let mut published = 0usize;
+        for (job_id, ep, path) in targets {
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            match bridge.publish_to_movies(&path.to_string_lossy(), &name).await {
+                Ok((uri, public_path)) => {
+                    // The shared copy is authoritative now; drop the private
+                    // duplicate to keep the workdir lean.
+                    let _ = std::fs::remove_file(&path);
+                    bump_job(host, &job_id, |j| {
+                        j.published.insert(ep, PublishedFile {
+                            uri: uri.clone(),
+                            public_path: public_path.clone(),
+                        });
+                    }, true);
+                    published += 1;
+                }
+                Err(e) => {
+                    bump_job(host, &job_id, |j| {
+                        j.message = format!("发布到公共目录失败：{e}");
+                    }, true);
+                }
+            }
+        }
+        let _ = app;
+        Ok(json!({ "published": published }))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, host);
+        Ok(json!({ "published": 0 }))
+    }
+}
+
+
+
+
+pub async fn open_dir(app: &tauri::AppHandle, host: &DownloadHost) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        // Scoped storage: the private working directory is invisible to file
+        // managers, so "打开目录" targets the PUBLIC publish folder
+        // (Movies/video-hub). The bridge locates the newest published MP4 in
+        // MT Manager; without MT it falls back to a video viewer on that file.
+        let newest_uri: Option<String> = {
+            let jobs = host.jobs.lock().map_err(|_| "download lock".to_string())?;
+            let mut best: Option<(u64, String)> = None;
+            for j in jobs.values() {
+                for p in j.published.values() {
+                    let at = j.updated_at;
+                    if best.as_ref().map_or(true, |(t, _)| at > *t) {
+                        best = Some((at, p.uri.clone()));
+                    }
+                }
+            }
+            best.map(|(_, uri)| uri)
+        };
+        let unused = newest_uri.is_none();
+        if let Some(bridge) = host.media_bridge() {
+            if let Some(uri) = newest_uri.as_deref() {
+                if bridge.open_in_manager(Some(uri)).await.is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        let _ = unused;
+        return Err("暂无已发布的视频：完成一次下载后 MP4 会出现在 Movies/video-hub".into());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let dir = root(host)?;
+        let path = dir.to_string_lossy().to_string();
+        app.opener()
+            .open_path(path, None::<&str>)
+            .map_err(|e| e.to_string())
+    }
+}
+
+pub async fn open_file(
     app: &tauri::AppHandle,
     host: &DownloadHost,
     plugin_id: &str,
@@ -2078,6 +2217,24 @@ pub fn open_file(
     ep: Option<u32>,
 ) -> Result<(), String> {
     let root = root(host)?;
+    // Published episodes: open the shared copy via its content URI — every
+    // player can read it, no FileProvider dance required.
+    #[cfg(target_os = "android")]
+    {
+        let hit: Option<String> = {
+            let jobs = host.jobs.lock().map_err(|_| "download lock".to_string())?;
+            jobs.values()
+                .find(|j| j.plugin_id == plugin_id && j.media_id == media_id)
+                .and_then(|j| {
+                    let ep_num = ep.unwrap_or(j.ep);
+                    j.published.get(&ep_num).map(|p| p.uri.clone())
+                })
+        };
+        if let Some(uri) = hit {
+            let bridge = host.media_bridge().ok_or_else(|| "媒体桥接尚未就绪".to_string())?;
+            return bridge.open_published(&uri).await;
+        }
+    }
     let path = if let Some(ep) = ep {
         let title = media_title(host, &root, media_id);
         let (mp4, ts, pl) = episode_media_files(&root, &title, media_id, ep);
@@ -2163,22 +2320,22 @@ pub async fn download_reset_dir(dl: tauri::State<'_, Arc<DownloadHost>>) -> Resu
 }
 
 #[tauri::command]
-pub fn download_open_dir(
+pub async fn download_open_dir(
     app: tauri::AppHandle,
     dl: tauri::State<'_, Arc<DownloadHost>>,
 ) -> Result<(), String> {
-    open_dir(&app, dl.inner())
+    open_dir(&app, dl.inner()).await
 }
 
 #[tauri::command]
-pub fn download_open_file(
+pub async fn download_open_file(
     app: tauri::AppHandle,
     dl: tauri::State<'_, Arc<DownloadHost>>,
     plugin_id: String,
     media_id: String,
     ep: Option<u32>,
 ) -> Result<(), String> {
-    open_file(&app, dl.inner(), &plugin_id, &media_id, ep)
+    open_file(&app, dl.inner(), &plugin_id, &media_id, ep).await
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
@@ -2218,10 +2375,18 @@ pub async fn download_get_settings(dl: tauri::State<'_, Arc<DownloadHost>>) -> R
 }
 
 #[tauri::command]
-pub async fn download_open_storage_settings(
+pub async fn download_request_legacy_write(
     dl: tauri::State<'_, Arc<DownloadHost>>,
-) -> Result<(), String> {
-    open_storage_settings(dl.inner()).await
+) -> Result<bool, String> {
+    request_legacy_write(dl.inner()).await
+}
+
+#[tauri::command]
+pub async fn download_publish_pending(
+    app: tauri::AppHandle,
+    dl: tauri::State<'_, Arc<DownloadHost>>,
+) -> Result<Value, String> {
+    publish_pending(app, dl.inner()).await
 }
 
 #[tauri::command]
@@ -2262,7 +2427,10 @@ mod tests {
 
     #[cfg(target_os = "android")]
     #[test]
-    fn android_default_dir_is_public_shared_root() {
+    fn android_public_root_is_publish_target_only() {
+        // The constant is the MediaStore publish target (display/legacy copy
+        // path), never the download working directory.
         assert_eq!(ANDROID_PUBLIC_ROOT, "/storage/emulated/0/Movies/video-hub");
+        assert!(ANDROID_PUBLIC_ROOT.starts_with("Movies/") || ANDROID_PUBLIC_ROOT.contains("/Movies/"));
     }
 }

@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -11,7 +12,7 @@ if (existsSync(manifest)) {
   mkdirSync(java, { recursive: true });
   copyFileSync(join(root, "src-tauri/android/OrientationPlugin.kt"), join(java, "OrientationPlugin.kt"));
   copyFileSync(join(root, "src-tauri/android/LoginWebViewProfile.kt"), join(java, "LoginWebViewProfile.kt"));
-  for (const name of ["LoginWebViewPlugin.kt", "LoginWebViewActivity.kt", "PluginDocumentsPlugin.kt", "PluginDocumentPaths.kt", "StorageAccessPlugin.kt"]) {
+  for (const name of ["LoginWebViewPlugin.kt", "LoginWebViewActivity.kt", "PluginDocumentsPlugin.kt", "PluginDocumentPaths.kt", "MediaBridgePlugin.kt"]) {
     copyFileSync(join(root, "src-tauri/android", name), join(java, name));
   }
   const test = join(main, "../androidTest");
@@ -55,6 +56,40 @@ if (existsSync(manifest)) {
       writeFileSync(gradleKts, gradle);
     }
   }
+  // TargetAPI 37: bump compile/target SDK in the generated gradle files
+  // (tauri's template lags behind; supports both kts DSL spellings).
+  const appGradle = join(main, "..", "..", "app", "build.gradle.kts");
+  if (existsSync(appGradle)) {
+    let g = readFileSync(appGradle, "utf8");
+    g = g.replace(/compileSdk(Version)?\s*=?\(?\s*\d+/g, (m) => m.replace(/\d+/, "37"));
+    g = g.replace(/targetSdk(Version)?\s*=?\(?\s*\d+/g, (m) => m.replace(/\d+/, "37"));
+    writeFileSync(appGradle, g);
+  }
+  // Older AGP versions warn (not fail) on newer compileSdk; suppress is belt
+  // and braces in case an AGP upgrade turns it into an error.
+  // CI runners may pin an older platform list: install the API 37 platform
+  // on demand when sdkmanager is reachable (local dev without an SDK skips).
+  try {
+    const sdkRoot = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || "";
+    const platform37 = sdkRoot ? join(sdkRoot, "platforms", "android-37") : "";
+    const sdkmanager = sdkRoot
+      ? [join(sdkRoot, "cmdline-tools", "latest", "bin", "sdkmanager"), join(sdkRoot, "cmdline-tools", "bin", "sdkmanager")]
+          .find(p => existsSync(p))
+      : undefined;
+    if (sdkRoot && sdkmanager && !existsSync(platform37)) {
+      execFileSync(sdkmanager, ["--licenses"], { input: "y\n".repeat(40), stdio: "ignore", timeout: 120000 });
+      execFileSync(sdkmanager, ["platforms;android-37"], { stdio: "ignore", timeout: 300000 });
+      console.log("[android] 已补装 platforms;android-37（TargetAPI 37）");
+    }
+  } catch { /* best-effort: the pinned list in CI may already carry 37 */ }
+  const gradleProps = join(main, "..", "..", "gradle.properties");
+  if (existsSync(gradleProps)) {
+    let gp = readFileSync(gradleProps, "utf8");
+    if (!gp.includes("android.suppressUnsupportedCompileSdk")) {
+      gp = gp.trimEnd() + "\nandroid.suppressUnsupportedCompileSdk=37\n";
+      writeFileSync(gradleProps, gp);
+    }
+  }
   let xml = readFileSync(manifest, "utf8");
   if (/android:networkSecurityConfig=/.test(xml)) xml = xml.replace(/android:networkSecurityConfig="[^"]*"/, 'android:networkSecurityConfig="@xml/network_security_config"');
   else xml = xml.replace(/<application\b/, '<application android:networkSecurityConfig="@xml/network_security_config"');
@@ -66,11 +101,13 @@ if (existsSync(manifest)) {
   if (!xml.includes('android:name=".LoginWebViewActivity"')) {
     xml = xml.replace("</application>", '    <activity android:name=".LoginWebViewActivity" android:exported="false" android:process=":hpp_login" android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|smallestScreenSize|uiMode" android:theme="@android:style/Theme.Material.Light.NoActionBar" />\n    </application>');
   }
-  // Download module: all-files access for the public shared folder on API 30+.
-  // WRITE_EXTERNAL_STORAGE is kept only for legacy <= API 28 installs.
+  // Download module (scoped storage, TargetAPI 37): NO all-files access.
+  // The engine works in the app-private dir; finished MP4s publish into the
+  // shared `Movies/video-hub` MediaStore collection — zero permissions on
+  // API 30+. WRITE_EXTERNAL_STORAGE stays requestable only for legacy <= 29
+  // installs (maxSdkVersion 29).
   const permissions = [
-    '<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />',
-    '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />',
+    '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />',
   ];
   for (const perm of permissions) {
     if (!xml.includes(perm.replace(/\s*\/>$/, "").split("\"")[1])) xml = xml.replace(/<application\b/, `    ${perm}\n    <application`);

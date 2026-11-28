@@ -27,6 +27,8 @@ export interface DownloadJob {
   readyEps: number[];
   episodes: DownloadEpisode[];
   updatedAt: number;
+  /** Android scoped-storage: episodes published into `Movies/video-hub`. */
+  published?: Record<number, { uri: string; publicPath: string }>;
 }
 
 /** Payload of the `download:job` event pushed by the Rust side. */
@@ -39,26 +41,27 @@ export interface DownloadJobEvent {
 export interface DownloadDirEvent {
   dir: string;
   effectiveDir?: string;
-  mode?: "public" | "fallback" | "custom";
+  mode?: "public" | "fallback" | "custom" | "workdir";
   reason?: string;
 }
 
-export type DownloadDirMode = "public" | "fallback" | "custom";
+export type DownloadDirMode = "public" | "fallback" | "custom" | "workdir";
 
 export interface DownloadSettings {
   dir: string;
   /** Active resolved directory (same as `dir`); the only path the UI should render. */
   effectiveDir: string;
-  /** Platform default directory: Android public shared root, otherwise app-data/downloads. */
+  /** Platform default directory: Android publish target, otherwise app-data/downloads. */
   defaultDir: string;
+  /** Android: public publish folder (`Movies/video-hub`); null elsewhere. */
   externalDir?: string | null;
   retries: number;
   mobile: boolean;
-  /** Android: whether all-files access is granted. Desktop always true. */
+  /** Android: legacy write grant held (always true on API 30+). Desktop true. */
   storageGranted: boolean;
-  /** Android: the active directory is the app-private fallback. */
+  /** Kept for payload compatibility; always false in the scoped-storage model. */
   fallback: boolean;
-  /** Active root mode: public default, private fallback, or user-picked custom. */
+  /** Active root mode: workdir (Android), public default, or user-picked custom. */
   mode: DownloadDirMode;
   /** Human-readable cause for the active directory. */
   reason: string;
@@ -113,9 +116,14 @@ export async function downloadGetSettings(): Promise<DownloadSettings> {
   return invoke<DownloadSettings>("download_get_settings");
 }
 
-/** Android: jump to the system all-files access settings page. No-op elsewhere. */
-export async function downloadOpenStorageSettings(): Promise<void> {
-  await invoke("download_open_storage_settings");
+/** Android: request the legacy write grant (API <= 29 publish prerequisite). */
+export async function downloadRequestLegacyWrite(): Promise<boolean> {
+  return invoke<boolean>("download_request_legacy_write");
+}
+
+/** Android: re-publish finished episodes whose earlier publish failed. */
+export async function downloadPublishPending(): Promise<{ published: number }> {
+  return invoke<{ published: number }>("download_publish_pending");
 }
 
 export async function downloadSetRetries(retries: number): Promise<{ retries: number }> {

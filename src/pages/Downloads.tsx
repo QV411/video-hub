@@ -5,13 +5,13 @@ import {
   downloadResetDir,
   downloadOpenDir,
   downloadOpenFile,
-  downloadOpenStorageSettings,
+  downloadRequestLegacyWrite,
+  downloadPublishPending,
   downloadStart,
   formatSize,
   type DownloadJob,
 } from "../download";
 import { useDownloads } from "../downloadStore";
-import { accessStatus, accessGuidance } from "../download-access";
 import { isMobile } from "../environment";
 import { useAssetUrls } from "../plugins/MediaCards";
 import {
@@ -92,14 +92,40 @@ function JobRow({
   const tone = jobTone(job);
   const active = tone === "running" || tone === "converting" || tone === "queued";
   const done = tone === "done";
+  const [rowNote, setErrorLocal] = useState("");
   const readyCount = job.readyEps.length;
   const pct = job.mode === "series" && job.totalEps > 0
     ? Math.min(1, readyCount / job.totalEps)
     : job.progress;
 
+  const publishedCount = job.published ? Object.keys(job.published).length : 0;
+  const publishPending = job.status === "done" && (
+    (job.mode === "series" && job.readyEps.length > publishedCount)
+    || (job.mode === "episode" && publishedCount === 0)
+  );
+
+  const republish = async () => {
+    setErrorLocal("正在重新发布…");
+    try {
+      const r = await downloadPublishPending();
+      setErrorLocal(r.published > 0 ? `已重新发布 ${r.published} 集` : "没有需要重新发布的集数");
+    } catch (e) {
+      setErrorLocal(e instanceof Error ? e.message : "重新发布失败");
+    }
+  };
+
+  const requestWrite = async () => {
+    try {
+      await downloadRequestLegacyWrite();
+      await republish();
+    } catch (e) {
+      setErrorLocal(e instanceof Error ? e.message : "无法请求存储权限");
+    }
+  };
+
   const remove = async () => {
     const label = job.mode === "series" ? `《${job.title}》整剧` : `第 ${job.ep} 集`;
-    if (!window.confirm(`清理${label}的下载缓存？\n已转换的 MP4 会保留在本机。`)) return;
+    if (!window.confirm(`清理${label}的下载记录与缓存？\n已发布到 Movies/video-hub 的 MP4 会保留。`)) return;
     try {
       await downloadDelete(job.pluginId, job.mediaId, job.mode === "episode" ? job.ep : undefined);
       onDeleted();
@@ -147,11 +173,17 @@ function JobRow({
         {(done || tone === "error" || tone === "interrupted") && job.message && (
           <p className="dl-meta">{job.message}</p>
         )}
+        {rowNote && <p className="dl-meta">{rowNote}</p>}
 
         <div className="dl-actions">
           {done && job.mode === "episode" && (
             <button onClick={() => void openFile(job.ep)} className="dl-btn dl-btn-secondary">
               打开文件
+            </button>
+          )}
+          {done && publishPending && (
+            <button onClick={() => void requestWrite()} className="dl-btn dl-btn-secondary">
+              重新发布
             </button>
           )}
           {job.mode === "series" && (
@@ -257,37 +289,23 @@ function SkeletonCards() {
 }
 
 export default function DownloadsPage({ onBack }: { onBack?: () => void }) {
-  const { jobs, dir, settings, ready, listError, refresh, refreshSettings } = useDownloads();
+  const { jobs, dir, settings, ready, listError, refresh } = useDownloads();
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [authBusy, setAuthBusy] = useState(false);
 
   const active = jobs.filter((j) => j.status === "running" || j.status === "queued");
   const history = jobs.filter((j) => j.status !== "running" && j.status !== "queued");
   const fallback = settings?.mode === "fallback";
-  const access = accessStatus(settings);
-  const needAuth = !!settings?.mobile && access === "denied";
-  const checkingAuth = !!settings?.mobile && access === "detecting";
+  const workdir = settings?.mode === "workdir";
 
-  const modeLabel = settings?.mode === "fallback"
-    ? "应用专属目录"
-    : settings?.mode === "custom"
-      ? "自选目录"
-      : "默认目录";
+  const modeLabel = workdir
+    ? "私有工作区"
+    : fallback
+      ? "应用专属目录"
+      : settings?.mode === "custom"
+        ? "自选目录"
+        : "默认目录";
   const activeDir = settings ? (settings.effectiveDir || settings.dir) : dir;
-
-  const authorize = async () => {
-    setAuthBusy(true);
-    setError("");
-    try {
-      await downloadOpenStorageSettings();
-      await refreshSettings();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "无法打开文件访问设置");
-    } finally {
-      setAuthBusy(false);
-    }
-  };
 
   const retryJob = async (job: DownloadJob) => {
     setError("");
@@ -385,19 +403,10 @@ export default function DownloadsPage({ onBack }: { onBack?: () => void }) {
           </p>
         )}
 
-        {needAuth && (
-          <div className="dl-banner is-denied">
-            <div className="dl-banner-body">
-              <p className="dl-banner-title">文件访问未授权</p>
-              <p className="dl-banner-guidance">{accessGuidance(settings)}</p>
-            </div>
-            <button onClick={() => void authorize()} disabled={authBusy} className="dl-btn dl-btn-primary">
-              授权所有文件访问
-            </button>
-          </div>
+        {workdir && settings?.externalDir && (
+          <p className="dl-note">完成的 MP4 会自动发布到公共媒体库 {settings.externalDir}，任何播放器与文件管理器可访问</p>
         )}
-        {checkingAuth && <p className="dl-note">正在检测文件访问授权状态…</p>}
-        {fallback && !needAuth && settings?.reason && (
+        {fallback && settings?.reason && (
           <p className="dl-note">{settings.reason}</p>
         )}
 
