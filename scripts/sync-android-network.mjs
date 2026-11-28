@@ -38,6 +38,19 @@ if (existsSync(manifest)) {
   const unit = join(main, "../test/java/com/videohub/player");
   mkdirSync(unit, { recursive: true });
   copyFileSync(join(root, "src-tauri/android/tests/PluginDocumentPathsTest.kt"), join(unit, "PluginDocumentPathsTest.kt"));
+
+  // Diagnostic report lands in the failure-logs capture path so a failed
+  // run's artifact carries the effective manifest/gradle state.
+  try {
+    const reportDir = join(main, "..", "..", "build", "outputs", "logs");
+    mkdirSync(reportDir, { recursive: true });
+    const report = [
+      `targetSdk-37-patch: ${existsSync(appGradle) ? "applied" : "skipped"}`,
+      `manifest: ${existsSync(manifest) ? readFileSync(manifest, "utf8").split("\n").filter(l => l.includes("uses-permission")).join(" | ") : "missing"}`,
+      `plugins: ${readdirSync(join(main, "java/com/videohub/player")).join(", ")}`,
+    ].join("\n");
+    writeFileSync(join(reportDir, "patch-report.txt"), report);
+  } catch { /* diagnostics are best-effort */ }
   const debug = join(main, "../debug");
   const debugJava = join(debug, "java/com/videohub/player");
   mkdirSync(debugJava, { recursive: true });
@@ -59,7 +72,7 @@ if (existsSync(manifest)) {
   // The bundled ffmpeg is exec'd from nativeLibraryDir; pin legacy JNI
   // packaging (extract on install) to match android:extractNativeLibs="true"
   // and silence the AGP useLegacyPackaging advisory.
-  const gradleKts = join(main, "..", "..", "build.gradle.kts");
+  const gradleKts = join(main, "..", "..", "..", "build.gradle.kts");
   if (existsSync(gradleKts)) {
     let gradle = readFileSync(gradleKts, "utf8");
     if (!gradle.includes("useLegacyPackaging")) {
@@ -73,7 +86,7 @@ if (existsSync(manifest)) {
   // TargetAPI 37: bump compile/target SDK in the generated gradle files.
   // Tauri's template lags behind. Handles all kts DSL spellings and INSERTS
   // the keys when the template omits them; verifies the result loudly.
-  const appGradle = join(main, "..", "..", "app", "build.gradle.kts");
+  const appGradle = join(main, "..", "..", "..", "app", "build.gradle.kts");
   if (existsSync(appGradle)) {
     let g = readFileSync(appGradle, "utf8");
     const bump = (text, key) => {
@@ -103,7 +116,7 @@ if (existsSync(manifest)) {
       console.log("[android] 已补装 platforms;android-37（TargetAPI 37）");
     }
   } catch { /* best-effort: the pinned list in CI may already carry 37 */ }
-  const gradleProps = join(main, "..", "..", "gradle.properties");
+  const gradleProps = join(main, "..", "..", "..", "gradle.properties");
   if (existsSync(gradleProps)) {
     let gp = readFileSync(gradleProps, "utf8");
     if (!gp.includes("android.suppressUnsupportedCompileSdk")) {
