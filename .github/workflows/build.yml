@@ -1,0 +1,373 @@
+name: Build video-hub APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: video-hub-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Detect whether a source snapshot zip was dropped into the repo root.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      has_zip: ${{ steps.check.outputs.has_zip }}
+      has_source: ${{ steps.check.outputs.has_source }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for source archive / tree
+        id: check
+        run: |
+          if [ -f video-hub.zip ]; then
+            echo "has_zip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_zip=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f src-tauri/tauri.conf.json ]; then
+            echo "has_source=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_source=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Import the snapshot (idempotent): replaces the tracked tree, keeps .github and .ci.
+  import:
+    needs: detect
+    # Always re-import: the data pointer (.ci/source-url.txt) may point to a
+    # new snapshot even when a source tree is already committed. The rsync is
+    # idempotent and the commit is a no-op when nothing changed.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Data-driven source pointer: .ci/source-url.txt holds URL=/SHA= lines.
+      # Bumping a version = updating that plain file via Contents API; no
+      # workflow edits required. An in-repo video-hub.zip still takes priority.
+      - name: Obtain source archive (in-repo file, else .ci/source-url.txt)
+        run: |
+          set -euo pipefail
+          if [ -f video-hub.zip ]; then
+            cp video-hub.zip /tmp/source.zip
+            echo "source: in-repo video-hub.zip"
+          else
+            URL=""
+            SHA=""
+            if [ -f .ci/source-url.txt ]; then
+              URL="$(grep -E '^URL=' .ci/source-url.txt | head -1 | cut -d= -f2-)"
+              SHA="$(grep -E '^SHA=' .ci/source-url.txt | head -1 | cut -d= -f2-)"
+            fi
+            # Inline defaults = the current snapshot; .ci/source-url.txt
+            # (plain Contents-API path) overrides them for future versions.
+            URL="${URL:-https://sfile.chatglm.cn/workspace/file/fc/fc2a231d21.zip}"
+            SHA="${SHA:-d5a414f448ce527cd1914bac500b4c31176873c1ff2ebc4c02a8c6f48e2c9b6f}"
+            echo "source: $URL"
+            curl -fL --retry 3 --connect-timeout 20 "$URL" -o /tmp/source.zip
+            echo "$SHA  /tmp/source.zip" | sha256sum -c -
+          fi
+          ls -lh /tmp/source.zip
+          unzip -tq /tmp/source.zip
+          # Self-seed the data pointer so future swaps are a one-file edit.
+          if [ -n "${URL:-}" ] && [ -n "${SHA:-}" ] && [ ! -f .ci/source-url.txt ]; then
+            mkdir -p .ci
+            printf 'URL=%s\nSHA=%s\n' "$URL" "$SHA" > .ci/source-url.txt
+            echo "seeded .ci/source-url.txt from inline defaults"
+          fi
+
+      - name: Import source files (replace tracked tree, keep .github and .ci)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/src && mkdir -p /tmp/src
+          unzip -q /tmp/source.zip -d /tmp/src
+          # Zip may be wrapped in a single top folder or laid flat at archive root.
+          TOP="$(find /tmp/src -mindepth 1 -maxdepth 1 | head -1)"
+          COUNT="$(find /tmp/src -mindepth 1 -maxdepth 1 | wc -l)"
+          if [ "$COUNT" -eq 1 ] && [ -d "$TOP" ]; then SRC="$TOP"; else SRC="/tmp/src"; fi
+          test -f "$SRC/package.json"
+          rsync -a --delete \
+            --exclude '.git/' --exclude '.github/' --exclude '.ci/' \
+            "$SRC"/ ./
+          rm -rf /tmp/src /tmp/source.zip
+          ls -la
+
+      - name: Verify bundled FFmpeg arm64 libs
+        run: |
+          set -euo pipefail
+          ( cd src-tauri/android/jniLibs/arm64-v8a && sha256sum -c SHA256SUMS.txt )
+
+      - name: Commit imported source
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Source already current; nothing to commit."
+          else
+            git commit -m "Import video-hub source snapshot (zip)"
+            git push origin main
+          fi
+
+  # Build the arm64 APK from the latest main (after import, or on plain pushes).
+  build:
+    needs: [detect, import]
+    # Import success is the single gate: the tree on main is always the
+    # snapshot the pointer references. A failed import must not trigger a
+    # stale build.
+    if: ${{ always() && needs.import.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      NDK_VERSION: "27.2.12479018"
+      ANDROID_KEYSTORE_DIR: ${{ github.workspace }}/keystore
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Skip if source not imported yet
+        run: |
+          test -f src-tauri/tauri.conf.json || { echo "[skip] source tree not imported yet"; exit 0; }
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configure preinstalled Android SDK
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          test -d "$SDK_ROOT"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager | sort | tail -1)"
+          test -n "$SDKMANAGER"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          dirname "$SDKMANAGER" >> "$GITHUB_PATH"
+
+      - name: Install SDK components and NDK
+        run: |
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "ndk;${NDK_VERSION}"
+          echo "NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install libclang (rquickjs bindgen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+          LIBCLANG_DIR="$(dirname "$(find /usr/lib/llvm-* -name libclang.so | sort | tail -1)")"
+          echo "LIBCLANG_PATH=$LIBCLANG_DIR" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Set up Node and pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm (official action-setup; corepack and npm -g both failed on runner)
+        uses: pnpm/action-setup@v6.1.1
+        with:
+          version: 11.29.0
+
+      # pnpm/action-setup resolves from npm registry. If that fails, fall back
+      # to the standalone binary straight from GitHub releases, bypassing npm.
+      - name: Ensure pnpm (standalone fallback direct from GitHub releases)
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if command -v pnpm >/dev/null 2>&1 && pnpm --version | grep -q '^11\.'; then
+            echo "pnpm: $(pnpm --version)"
+            exit 0
+          fi
+          echo "[fallback] pnpm missing or wrong version; downloading standalone binary"
+          curl -fsSL --retry 3 --connect-timeout 15 \
+            "https://github.com/pnpm/pnpm/releases/download/v11.29.0/pnpm-linux-x64.tar.gz" \
+            -o /tmp/pnpm.tgz
+          # The launcher embeds node and resolves dist/pnpm.mjs relative to
+          # itself, so the whole tarball must land in one directory.
+          rm -rf "$HOME/.local/pnpm-standalone"
+          mkdir -p "$HOME/.local/pnpm-standalone"
+          tar -xzf /tmp/pnpm.tgz -C "$HOME/.local/pnpm-standalone"
+          chmod +x "$HOME/.local/pnpm-standalone/pnpm"
+          echo "$HOME/.local/pnpm-standalone" >> "$GITHUB_PATH"
+          "$HOME/.local/pnpm-standalone/pnpm" --version
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify bundled FFmpeg arm64 libs
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        run: |
+          set -euo pipefail
+          ( cd src-tauri/android/jniLibs/arm64-v8a && sha256sum -c SHA256SUMS.txt )
+          ls -lh src-tauri/android/jniLibs/arm64-v8a
+
+      - name: Restore signing keystore
+        uses: actions/cache@v4
+        with:
+          # Non-hidden dir: upload-artifact@v4 ignores dot-directories by default.
+          path: keystore
+          key: android-keystore-video-hub-v2
+
+      - name: Restore signing keystore from repo secret (rebuild recovery)
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_KEYSTORE_DIR"
+          KS="$ANDROID_KEYSTORE_DIR/video-hub-release.keystore"
+          if [ ! -s "$KS" ] && [ -n "${KEYSTORE_B64:-}" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$KS"
+            chmod 600 "$KS"
+            echo "KEYSTORE_FROM_SECRET=1"
+          fi
+          ls -la "$ANDROID_KEYSTORE_DIR" || true
+
+      - name: Generate signing keystore on cache miss
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_KEYSTORE_DIR"
+          echo "[keystore] content before:"; ls -la "$ANDROID_KEYSTORE_DIR"
+          KS="$ANDROID_KEYSTORE_DIR/video-hub-release.keystore"
+          if [ ! -s "$KS" ]; then
+            keytool -genkeypair -v \
+              -keystore "$KS" \
+              -alias hghub -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass hghub123 -keypass hghub123 \
+              -dname "CN=HGhub Custom, OU=Dev, O=Local, L=Jinan, ST=Shandong, C=CN"
+            echo "KEYSTORE_GENERATED=1" >> "$GITHUB_ENV"
+          fi
+          test -s "$KS" || { echo "[keystore] MISSING after generate"; exit 1; }
+          keytool -list -keystore "$KS" -storepass hghub123 | head -5
+          echo "VIDEO_HUB_KEYSTORE=$KS" >> "$GITHUB_ENV"
+          echo "VIDEO_HUB_STOREPASS=hghub123" >> "$GITHUB_ENV"
+          echo "VIDEO_HUB_KEYPASS=hghub123" >> "$GITHUB_ENV"
+          echo "VIDEO_HUB_KEY_ALIAS=hghub" >> "$GITHUB_ENV"
+
+      - name: Upload signing keystore artifact
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-hub-signing-keystore
+          path: keystore/
+          retention-days: 30
+
+      - name: Generate Android project (tauri android init)
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        run: pnpm tauri android init --ci
+
+      - name: Build APK (aarch64 release)
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        run: pnpm tauri android build --target aarch64 --apk --ci
+
+      - name: Sign release APK
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          UNSIGNED="$(find src-tauri/gen/android/app/build/outputs/apk -name '*release*.apk' | head -1)"
+          test -n "$UNSIGNED"
+          "$BUILD_TOOLS/zipalign" -P 16 -f 4 "$UNSIGNED" /tmp/video-hub-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$VIDEO_HUB_KEYSTORE" \
+            --ks-key-alias "$VIDEO_HUB_KEY_ALIAS" \
+            --ks-pass "pass:$VIDEO_HUB_STOREPASS" \
+            --key-pass "pass:$VIDEO_HUB_KEYPASS" \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            --v3-signing-enabled true --v4-signing-enabled false \
+            --out video-hub-aarch64.apk /tmp/video-hub-aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs video-hub-aarch64.apk
+
+      # run4 lesson: after Rust+gradle the 14GB runner disk is exhausted, so the
+      # plain `cp` here died with "No space left". Reclaim space before collecting.
+      - name: Free disk space before collection
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        run: |
+          set -uo pipefail
+          df -h / | tail -1 || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          sudo rm -rf /var/lib/docker /var/lib/containerd || true
+          rm -rf ~/.cargo/registry ~/.cargo/git || true
+          df -h / | tail -1
+
+      - name: Collect artifacts
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        run: |
+          set -euo pipefail
+          ls -lh video-hub-aarch64.apk
+          mkdir -p dist
+          cp video-hub-aarch64.apk dist/
+          ( cd dist && sha256sum video-hub-aarch64.apk > SHA256SUMS.txt )
+          cat dist/SHA256SUMS.txt
+          ls -lh dist
+
+      - name: Upload APK
+        if: ${{ hashFiles('src-tauri/tauri.conf.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-hub-aarch64-apk
+          # Both sources: if the cp in Collect ever fails again, the root APK
+          # (already signed+verified in the Sign step) still gets uploaded.
+          path: |
+            dist/
+            video-hub-aarch64.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Read version for release tag
+        if: ${{ success() && hashFiles('src-tauri/tauri.conf.json') != '' }}
+        id: ver
+        run: echo "ver=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")" >> "$GITHUB_OUTPUT"
+
+      - name: Publish APK to GitHub Release
+        if: ${{ success() && hashFiles('src-tauri/tauri.conf.json') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.ver.outputs.ver }}"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            && gh release upload "$TAG" --clobber dist/video-hub-aarch64.apk dist/SHA256SUMS.txt \
+            || gh release create "$TAG" --title "video-hub $TAG" \
+                 --notes "自动构建 aarch64 release · versionCode 见 tauri.conf.json" \
+                 dist/video-hub-aarch64.apk dist/SHA256SUMS.txt
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name'
+
+      - name: Upload failure logs
+        if: ${{ failure() && hashFiles('src-tauri/tauri.conf.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-logs
+          path: |
+            src-tauri/gen/android/app/build/outputs/logs/
+            src-tauri/target/**/*.log
+          if-no-files-found: ignore
