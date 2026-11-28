@@ -1,5 +1,19 @@
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+
+// Locate sdkmanager across cmdline-tools versioned dirs, then PATH.
+function findSdkManager(sdkRoot) {
+  try {
+    const toolsDir = join(sdkRoot, "cmdline-tools");
+    if (existsSync(toolsDir)) {
+      for (const ver of readdirSync(toolsDir)) {
+        const candidate = join(toolsDir, ver, "bin", "sdkmanager");
+        if (existsSync(candidate)) return candidate;
+      }
+    }
+  } catch { /* fall through */ }
+  return "sdkmanager"; // rely on PATH
+}
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -56,14 +70,24 @@ if (existsSync(manifest)) {
       writeFileSync(gradleKts, gradle);
     }
   }
-  // TargetAPI 37: bump compile/target SDK in the generated gradle files
-  // (tauri's template lags behind; supports both kts DSL spellings).
+  // TargetAPI 37: bump compile/target SDK in the generated gradle files.
+  // Tauri's template lags behind. Handles all kts DSL spellings and INSERTS
+  // the keys when the template omits them; verifies the result loudly.
   const appGradle = join(main, "..", "..", "app", "build.gradle.kts");
   if (existsSync(appGradle)) {
     let g = readFileSync(appGradle, "utf8");
-    g = g.replace(/compileSdk(Version)?\s*=?\(?\s*\d+/g, (m) => m.replace(/\d+/, "37"));
-    g = g.replace(/targetSdk(Version)?\s*=?\(?\s*\d+/g, (m) => m.replace(/\d+/, "37"));
+    const bump = (text, key) => {
+      const re = new RegExp(`${key}(Version)?\\s*=?\\(?\\s*\\d+`, "g");
+      if (re.test(text)) return text.replace(re, (m) => m.replace(/\d+/, "37"));
+      if (key === "compileSdk") return text.replace(/android\s*\{/, "android {\n    compileSdk = 37");
+      return text.replace(/defaultConfig\s*\{/, "defaultConfig {\n        targetSdk = 37");
+    };
+    g = bump(g, "compileSdk");
+    g = bump(g, "targetSdk");
+    const ok37 = /compileSdk(Version)?\s*=?\(?\s*37/.test(g) && /targetSdk(Version)?\s*=?\(?\s*37/.test(g);
     writeFileSync(appGradle, g);
+    if (!ok37) console.log("[android] 警告：TargetAPI 37 改写未验证成功，请检查 app/build.gradle.kts");
+    else console.log("[android] compileSdk/targetSdk 已对齐 TargetAPI 37");
   }
   // Older AGP versions warn (not fail) on newer compileSdk; suppress is belt
   // and braces in case an AGP upgrade turns it into an error.
@@ -72,10 +96,7 @@ if (existsSync(manifest)) {
   try {
     const sdkRoot = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || "";
     const platform37 = sdkRoot ? join(sdkRoot, "platforms", "android-37") : "";
-    const sdkmanager = sdkRoot
-      ? [join(sdkRoot, "cmdline-tools", "latest", "bin", "sdkmanager"), join(sdkRoot, "cmdline-tools", "bin", "sdkmanager")]
-          .find(p => existsSync(p))
-      : undefined;
+    const sdkmanager = sdkRoot ? findSdkManager(sdkRoot) : undefined;
     if (sdkRoot && sdkmanager && !existsSync(platform37)) {
       execFileSync(sdkmanager, ["--licenses"], { input: "y\n".repeat(40), stdio: "ignore", timeout: 120000 });
       execFileSync(sdkmanager, ["platforms;android-37"], { stdio: "ignore", timeout: 300000 });

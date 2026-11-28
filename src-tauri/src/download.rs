@@ -968,6 +968,8 @@ async fn start(
         title: title.clone(),
         cover: cover.clone(),
         ep: if mode == "series" { 1 } else { ep_number },
+        #[cfg(target_os = "android")]
+        published: Default::default(),
         total_eps,
         mode: mode.to_string(),
         status: "queued".into(),
@@ -1045,6 +1047,8 @@ fn existing_done_job(
         title: title.to_string(),
         cover: cover.clone(),
         ep,
+        #[cfg(target_os = "android")]
+        published: Default::default(),
         total_eps,
         mode: mode.to_string(),
         status: "done".into(),
@@ -1358,8 +1362,9 @@ async fn publish_episode(host: &DownloadHost, job_id: &str, ep: u32, video_path:
     match bridge.publish_to_movies(&video_path.to_string_lossy(), name).await {
         Ok((uri, public_path)) => {
             let _ = std::fs::remove_file(video_path);
+            let record = PublishedFile { uri, public_path };
             bump_job(host, job_id, |j| {
-                j.published.insert(ep, PublishedFile { uri, public_path });
+                j.published.insert(ep, record.clone());
                 j.message = format!("第 {} 集已离线 · 已发布到 Movies/video-hub", ep);
             }, true);
         }
@@ -1370,7 +1375,7 @@ async fn publish_episode(host: &DownloadHost, job_id: &str, ep: u32, video_path:
                 format!("第 {ep} 集已离线；发布到公共目录失败：{e}")
             };
             bump_job(host, job_id, |j| {
-                j.message = note;
+                j.message = note.clone();
             }, true);
         }
     }
@@ -2188,7 +2193,7 @@ pub async fn open_dir(app: &tauri::AppHandle, host: &DownloadHost) -> Result<(),
             }
             best.map(|(_, uri)| uri)
         };
-        let unused = newest_uri.is_none();
+        let _ = app;
         if let Some(bridge) = host.media_bridge() {
             if let Some(uri) = newest_uri.as_deref() {
                 if bridge.open_in_manager(Some(uri)).await.is_ok() {
@@ -2196,7 +2201,6 @@ pub async fn open_dir(app: &tauri::AppHandle, host: &DownloadHost) -> Result<(),
                 }
             }
         }
-        let _ = unused;
         return Err("暂无已发布的视频：完成一次下载后 MP4 会出现在 Movies/video-hub".into());
     }
     #[cfg(not(target_os = "android"))]
